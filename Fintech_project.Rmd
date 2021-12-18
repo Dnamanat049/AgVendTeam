@@ -1,0 +1,495 @@
+---
+title: "AgVend Customer Loyalty Project"
+author: "Fintech Practicum"
+date: "12/3/2021"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.align = "center",
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE
+)
+library(tidyverse)
+library(dplyr)
+library(lubridate) #Enables us to manipulate dates
+library(vip)
+library(tidymodels)
+library(ggpubr)
+library(Hmisc)
+library(corrplot)
+library(tidyr)
+library(tibble)
+library(caret)
+```
+
+
+```{r loading_data}
+#Loading invoices and cost per acre
+invoices <- read.csv("invoices.csv", header = TRUE)
+cost_per_acre <- read.csv("cost_per_acre.csv", header = TRUE)
+
+```
+
+```{r cleaning_data}
+
+# Loading and cleaning up acreage data
+# Changes the file name and makes the variables easier to work with
+
+acre_totals <- read.csv("acre_totals.csv", header = TRUE)
+acre_totals <- rename(acre_totals, client_id = Client.ID)
+acre_totals <- transform(acre_totals, client_id = as.numeric(client_id))
+
+# Wrangling cost per acre to get total cost per year by crop for an acre
+
+cost_per_acre <- cost_per_acre %>%
+  group_by(Crop.name) %>%
+  dplyr::summarize(cpa = sum(value))
+
+
+# Converting invoice dates into a "dates" lubridate variable
+invoices$invoice_date <- as.Date(invoices$invoice_date)
+
+# Changing empty item category names into a "MISC" category
+invoices <- invoices %>%
+  mutate(item__category__name = replace(item__category__name, 
+                                        item__category__name == "", "MISC")) %>%
+  mutate(item__category_name = replace_na(item__category__name, "MISC"))
+
+```
+
+
+```{r spend_feature_engineering}
+
+# Setting up some dates as reference points for the data, so that "loyalty" 
+#is measured by data within the past three years
+today <- today()
+year_ago <- today - years(1)
+three_years_ago <- today - years(3)
+  
+
+# Generating the average monthly spend first for the past year, then for 
+# the past three years
+spending_by_months <- invoices %>%
+  group_by(client_id) %>%
+  dplyr::summarize(average_12_months_spend = sum(total[invoice_date %within% interval(Sys.Date()-years(1), Sys.Date())], na.rm = TRUE)/12,
+    
+    average_36_months_spend = sum(total[invoice_date %within% interval(Sys.Date()-years(3), Sys.Date())], na.rm = TRUE)/36)
+
+# Generating average spending within the top 1, 3, and 6 months over the past three years
+max_months <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "month")) %>%
+  filter(invoice_date > three_years_ago) %>%
+  dplyr::summarize(by_month = sum(total)) %>%
+  mutate(top_1_month_spend = max(by_month)) %>%
+  slice_max(by_month, n = 6) %>%
+  mutate(top_6_months_avg_spend = mean(by_month, na.rm = TRUE)) %>%
+  slice_max(by_month, n = 3) %>%
+  mutate(top_3_months_avg_spend = mean(by_month, na.rm = TRUE)) %>%
+  dplyr::select(client_id, top_1_month_spend, top_3_months_avg_spend, top_6_months_avg_spend)
+```
+
+
+```{r product_feature_engineering}
+
+# Generating the average monthly distinct products purchased over the past three years
+spending_by_months_product_three_years <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "month")) %>%
+  filter(month > three_years_ago) %>%
+  dplyr::summarize(mnthly_distinct_products = n_distinct(item__category__name)) %>%
+  dplyr::summarize(average_36_months_product = sum(mnthly_distinct_products)/36)
+  
+
+# Generating the average monthly distinct products purchased over the past year
+spending_by_months_product_one_year <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "month")) %>%
+  filter(month > year_ago) %>%
+  dplyr::summarize(average_12_months_product = n_distinct(item__category__name)) %>%
+  dplyr::summarize(average_12_months_product = sum(average_12_months_product)/12)
+
+
+# Generating the highest single month number of products purchased in the last three years
+product_max_months <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "month")) %>%
+  filter(month > three_years_ago) %>%
+  dplyr::summarize(mnthly_products = n_distinct(item__category__name)) %>%
+  slice_max(mnthly_products, n = 6) %>%
+  mutate(top_6_months_avg_product = mean(mnthly_products)) %>%
+  slice_max(mnthly_products, n = 3) %>%
+  mutate(top_3_months_avg_product = mean(mnthly_products)) %>%
+  slice_max(mnthly_products, n = 1) %>%
+  mutate(top_1_month_product = max(mnthly_products)) %>%
+  dplyr::select(client_id, top_6_months_avg_product, top_3_months_avg_product, top_1_month_product)
+
+```
+
+```{r season_feature_engineering}
+
+# Generating seasonal data for spending
+seasonal_average_spend <- invoices %>%
+  group_by(client_id, season = lubridate::floor_date(invoice_date, "season")) %>%
+  filter(season > three_years_ago) %>%
+  dplyr::summarize(seasonal_spend = sum(total)) %>%
+  mutate(seasonal = ifelse(month(season) == 3, "Spring_spend", 
+                           ifelse(month(season) == 6, "Summer_spend", 
+                           ifelse(month(season) == 9, "Fall_spend",
+                           ifelse(month(season) == 12, "Winter_spend", 0))))) %>%
+  ungroup() %>%
+  group_by(client_id, seasonal) %>%
+  dplyr::summarize(seasonal_average_spend = mean(seasonal_spend)) %>%
+  pivot_wider(names_from = seasonal, values_from = seasonal_average_spend) %>%
+  replace_na(list(Summer_spend = 0, Winter_spend = 0, Fall_spend = 0, Spring_spend = 0))
+
+# Generating seasonal data for products
+seasonal_average_products <- invoices %>%
+  group_by(client_id, season = lubridate::floor_date(invoice_date, "season")) %>%
+  filter(season > three_years_ago) %>%
+  dplyr::summarize(seasonal_spend = n_distinct(item__category__name)) %>%
+  mutate(seasonal = ifelse(month(season) == 3, "Spring_products", 
+                           ifelse(month(season) == 6, "Summer_products", 
+                           ifelse(month(season) == 9, "Fall_products",
+                           ifelse(month(season) == 12, "Winter_products", 0))))) %>%
+  ungroup() %>%
+  group_by(client_id, seasonal) %>%
+  dplyr::summarize(seasonal_average_spend = mean(seasonal_spend)) %>%
+  pivot_wider(names_from = seasonal, values_from = seasonal_average_spend) %>%
+  replace_na(list(Summer_products = 0, Winter_products = 0, Fall_products = 0, Spring_products = 0))
+
+
+
+
+```
+
+```{r extra_feature_engineering}
+
+# Generating number of months in past 36 months with a purchase
+thirty_six_months_purchases <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "month")) %>%
+  filter(month > three_years_ago) %>%
+  filter(total > 0) %>%
+  dplyr::summarize(by_month = sum(total)) %>%
+  mutate(months_with_purchase = 1) %>%
+  ungroup() %>%
+  group_by(client_id) %>%
+  dplyr::summarize(months_with_purchases_in_36_months = sum(months_with_purchase))
+
+# Generating number of months in past 12 months with a purchase
+twelve_months_purchases <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "month")) %>%
+  filter(month > year_ago) %>%
+  filter(total > 0) %>%
+  dplyr::summarize(by_month = sum(total)) %>%
+  mutate(months_with_purchase = 1) %>%
+  ungroup() %>%
+  group_by(client_id) %>%
+  dplyr::summarize(months_with_purchases_in_12_months = sum(months_with_purchase))
+
+# Calculating the number of years that a grower has been in the database
+num_years_in_database <- invoices %>%
+  group_by(client_id, month = lubridate::floor_date(invoice_date, "year")) %>%
+  dplyr::summarize(by_year = sum(total)) %>%
+  mutate(counter = 1) %>%
+  ungroup() %>%
+  group_by(client_id) %>%
+  dplyr::summarize(years_in_database = sum(counter))
+  
+
+
+```
+
+```{r joining_datasets}
+
+joined_set <- max_months %>%
+  full_join(spending_by_months, by = "client_id", copy = TRUE) %>% #Was right join
+  full_join(product_max_months, by = "client_id", copy = TRUE) %>%
+  full_join(spending_by_months_product_one_year, by = "client_id", copy = TRUE) %>%
+  full_join(spending_by_months_product_three_years, by = "client_id", copy = TRUE) %>% #NAs come in here
+  full_join(num_years_in_database, by = "client_id", copy = TRUE) %>%
+  full_join(twelve_months_purchases, by = "client_id", copy = TRUE) %>%
+  full_join(thirty_six_months_purchases, by = "client_id", copy = TRUE) %>%
+  full_join(seasonal_average_products, by = "client_id", copy = TRUE) %>%
+  full_join(seasonal_average_spend, by = "client_id", copy = TRUE) %>%
+  group_by(client_id) %>%
+  dplyr::summarize(
+    
+            #spend
+            average_36_months_spend = mean(average_36_months_spend), 
+            average_12_months_spend = mean(average_12_months_spend), 
+            top_1_month_spend = mean(top_1_month_spend), 
+            top_6_months_avg_spend = mean(top_6_months_avg_spend), 
+            top_3_months_avg_spend = mean(top_3_months_avg_spend),
+            
+            #product
+            average_36_months_product = mean(average_36_months_product), 
+            average_12_months_product = mean(average_12_months_product), 
+            top_1_month_product = mean(top_1_month_product),
+            top_3_months_avg_product = mean(top_3_months_avg_product),
+            top_6_months_avg_product = mean(top_6_months_avg_product),
+            
+            #seasons product
+            Fall_spend = mean(Fall_spend),
+            Spring_spend = mean(Spring_spend),
+            Winter_spend = mean(Winter_spend),
+            Summer_spend = mean(Summer_spend),
+            
+            #seasons spend
+            Fall_products = mean(Fall_products),
+            Spring_products = mean(Spring_products),
+            Winter_products = mean(Winter_products),
+            Summer_products = mean(Summer_products),
+            
+            #months with purchases
+            months_with_purchases_in_36_months = mean(months_with_purchases_in_36_months),
+            months_with_purchases_in_12_months = mean(months_with_purchases_in_12_months),
+            
+            #years in database
+            years_in_database = mean(years_in_database)) %>%
+  mutate(
+         #spend ratios
+         avg_12_36_ratio_spend = average_12_months_spend/average_36_months_spend,
+         avg12_top_1_month_ratio_spend = average_12_months_spend/top_1_month_spend,
+         avg12_top_3_months_ratio_spend = average_12_months_spend/top_3_months_avg_spend,
+         avg12_top_6_month_ratio_spend = average_12_months_spend/top_6_months_avg_spend,
+  
+         #product ratios
+         avg_12_36_ratio_product = average_12_months_product/average_36_months_product,
+         avg12_top_1_month_ratio_product = average_12_months_product/top_1_month_product,
+         avg12_top_3_months_ratio_product = average_12_months_product/top_3_months_avg_product,
+         avg12_top_6_month_ratio_product = average_12_months_product/top_6_months_avg_product) %>%
+  replace_na(list(
+            #REPLACING VALUES THAT ARE NA WITH 0
+            average_36_months_spend = 0,
+            average_12_months_spend = 0,
+            top_1_month_spend = 0,
+            top_6_months_avg_spend = 0,
+            top_3_months_avg_spend = 0,
+            average_36_months_product = 0,
+            average_12_months_product = 0,
+            top_1_month_product = 0,
+            top_3_months_avg_product = 0,
+            top_6_months_avg_product = 0,
+            Fall_spend = 0,
+            Spring_spend = 0,
+            Winter_spend = 0,
+            Summer_spend = 0,
+            Fall_products = 0,
+            Spring_products = 0,
+            Winter_products = 0,
+            Summer_products = 0,
+            months_with_purchases_in_36_months = 0,
+            months_with_purchases_in_12_months = 0,
+            years_in_database = 0,
+            avg_12_36_ratio_spend = 0,
+            avg12_top_1_month_ratio_spend = 0,
+            avg12_top_3_months_ratio_spend = 0,
+            avg12_top_6_month_ratio_spend = 0,
+            avg_12_36_ratio_product = 0,
+            avg12_top_1_month_ratio_product = 0,
+            avg12_top_3_months_ratio_product = 0,
+            avg12_top_6_month_ratio_product = 0))
+
+
+# Joining acre_totals and invoices
+full_invoices <- invoices %>%
+  right_join(acre_totals, by = "client_id", copy = TRUE)
+
+# Generate the wallet share year for clients for whom we have acreage. We assume a 50-50 split between corn and soybeans in order to estimate total spending. We hard code the values 299 and 132 from the cost_per_acre file
+wallet_share <- full_invoices %>%
+  group_by(client_id, year = lubridate::floor_date(invoice_date, "year")) %>%
+  dplyr::summarize(yearly_spend = sum(total), Acres = mean(Acres)) %>%
+  mutate(wallet_share = yearly_spend/(.5*Acres*299 + .5*Acres*132)) %>%
+  mutate(wallet_share = ifelse(wallet_share < 0, 0, wallet_share)) %>%
+  replace_na(list(wallet_share = 0, yearly_spend = 0))
+
+# Select wallet shares from 2020. IMPORTANT: 2020 IS A SUBJECTIVE CHOICE! FEEL FREE TO DO 2019 OR ANOTHER YEAR
+forest_wallet_share <- wallet_share %>%
+  filter(year > (today - years(2))) %>% #CHANGE THIS TO CHANGE YEAR
+  filter(year < (today - years(1))) %>% #CHANGE THIS TO CHANGE YEAR
+  dplyr::select(client_id, wallet_share) %>%
+  filter(wallet_share < 1.0)
+
+wallet_share_joined_set <- joined_set %>%
+  right_join(forest_wallet_share, by = "client_id", copy = TRUE)
+  
+```
+
+
+```{r random_forest}
+set.seed(4747)
+
+
+my_cor_matrix <- round(cor(wallet_share_joined_set, method = "spearman", use = "complete.obs"), 2)
+
+hc <- findCorrelation(my_cor_matrix, cutoff=.85, exact = TRUE) # putt any value as a "cutoff" 
+hc <- sort(hc)
+reduced_Data <- wallet_share_joined_set[,-c(hc)]
+
+no_na_joined_set <- reduced_Data %>% #used to be joined_set
+  drop_na()
+  
+
+WS_split <- initial_split(no_na_joined_set, prop = 0.75)
+WS_train <- training(WS_split)
+WS_test <- testing(WS_split)
+
+
+# recipe
+WS_rf_recipe <- recipe (wallet_share ~ ., data = WS_train) %>%
+  update_role(client_id, new_role = "ID variable")
+
+# model
+WS_rf <- rand_forest(mtry = tune(),
+                 trees = tune()) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("regression")
+
+# workflow
+WS_wf <- workflow() %>%
+  add_model(WS_rf) %>%
+  add_recipe(WS_rf_recipe)
+
+# CV
+set.seed(234)
+WS_folds <- vfold_cv(WS_train,
+v = 4)
+# parameters
+WS_grid <- grid_regular(mtry(range = c(1,10)),
+                             trees(range = c(1,401)),
+                             levels = 5)
+# tune
+WS_rf_tune <-
+  WS_wf %>%
+  tune_grid(resamples = WS_folds,
+            grid = WS_grid)
+
+WS_rf_tune %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  ggplot() +
+  geom_line(aes(color = as.factor(trees), y = mean, x = mtry)) # trees as legend var
+```
+
+
+```{r}
+set.seed(1709)
+
+# model
+WS_final_rf_model <- rand_forest(mtry = 5,
+                                 trees = 401) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("regression")
+
+# workflow
+WS_final_rf_wf <- workflow() %>%
+  add_model(WS_final_rf_model) %>%
+  add_recipe(WS_rf_recipe)
+
+# fit
+WS_final_rf_fit <- WS_final_rf_wf %>%
+  fit(data = WS_train)
+
+# computing MSE
+plottable <- WS_final_rf_fit %>%
+  predict(new_data = WS_test) %>%
+  cbind(WS_test) 
+
+#RMSE
+plottable %>%
+  dplyr::summarize(rmse = sqrt(mean((.pred - wallet_share)^2)))
+
+#MAE
+plottable %>%
+  dplyr::summarize(mae = mean(abs(.pred - wallet_share)))
+```
+
+```{r}
+plottable %>% ggplot() +
+  geom_point(aes(x=wallet_share, y = .pred)) +
+  geom_smooth(aes(x=wallet_share, y = .pred), method='lm') +
+  geom_abline(intercept = 0, slope = 1) +
+  ggtitle("Acreage-estimated Wallet Share vs. Model-estimated Wallet Share") +
+  labs(x = "Acreage Estimated Wallet Share", y = "Model-estimated Wallet Share")
+```
+
+
+```{r}
+ WS_final_rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")
+```
+ 
+
+```{r correlation_visualization}
+
+most_important_data <- joined_set %>%
+  select(Summer_products, top_1_month_product, avg12_top_6_month_ratio_product, Summer_spend, months_with_purchases_in_36_months, avg_12_36_ratio_product, Fall_products, average_12_months_spend, avg_12_36_ratio_spend, top_1_month_spend)
+
+limited_cor_matrix <- round(cor(most_important_data, method = "spearman", use = "complete.obs"), 2)
+
+# method = "circle"
+corrplot(limited_cor_matrix, method = "circle", order = "hclust", type = "lower")
+
+```
+ 
+```{r}
+complete_wallet_share_set <- joined_set %>%
+  full_join(forest_wallet_share, by = "client_id", copy = TRUE) %>%
+  left_join(acre_totals, by = "client_id", copy = TRUE)
+
+
+  
+predicted_wallet_shares <- WS_final_rf_fit %>%
+  predict(new_data = complete_wallet_share_set) %>%
+  cbind(complete_wallet_share_set) %>%
+  group_by(client_id) %>%
+  dplyr::mutate(random_forest_wallet_share = ifelse(is.na(wallet_share), .pred, wallet_share)) %>%
+  select(client_id, random_forest_wallet_share, Acres, wallet_share)
+
+#Please change this path to whatever path you see fit
+write.csv(predicted_wallet_shares,"rf_wallet_shares.csv", row.names = FALSE)
+write.csv(joined_set, "predictors.csv", row.names = FALSE)
+```
+
+
+
+VISUALIZATIONS:
+```{r}
+predicted_wallet_shares %>% 
+  filter(random_forest_wallet_share > 0.1) %>%
+  ggplot(aes(x=random_forest_wallet_share)) +
+  stat_bin() + 
+  ggtitle("Wallet Share Distribution of All Growers (Excluding those <0.1)") +
+  labs(x = "Estimated Wallet Share", y = "Count")
+
+
+```
+
+```{r}
+testing_data <- WS_final_rf_fit %>%
+  predict(new_data = complete_wallet_share_set) %>%
+  cbind(complete_wallet_share_set) %>%
+  group_by(client_id) %>%
+  dplyr::mutate(random_forest_wallet_share = ifelse(is.na(wallet_share), NA, .pred)) %>%
+  select(client_id, random_forest_wallet_share, Acres, wallet_share)
+
+testing_data %>% ggplot(aes(x=random_forest_wallet_share)) +
+  stat_bin() +
+  ggtitle("(RF) Wallet Share Distribution of Growers Who Reported Acreage") +
+  labs(x = "Random Forest Estimated Wallet Share", y = "Count")
+```
+
+
+```{r}
+complete_wallet_share_set %>% ggplot(aes(x=wallet_share)) +
+  stat_bin() +
+  ggtitle("(Acreage) Wallet Share Distribution of Growers Who Reported Acreage") +
+  labs(x = "Acreage Estimated Wallet Share", y = "Count")
+
+
+```
